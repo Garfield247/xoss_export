@@ -7,8 +7,14 @@
 
 import sys
 import os
+
+# 屏蔽 QtWebEngine 的冗余日志输出
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--log-level=3"
+
 import time
 import threading
+import json
+import requests
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication,
@@ -29,12 +35,137 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QSplitter,
     QFrame,
+    QDialog,
+    QRadioButton,
+    QButtonGroup,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QStandardPaths
+from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QImage
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
+from PyQt5.QtNetwork import QNetworkCookie
 
 # 导入核心导出功能
 from xoss_export import run_export, convert_sport_to_number
+
+
+class SettingsManager:
+    """配置管理类"""
+    def __init__(self, app_name="xoss_export"):
+        # 获取系统标准的 AppData 路径
+        self.data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            
+        self.config_file = self.data_dir / "config.json"
+        self.avatar_file = self.data_dir / "avatar.jpg"
+        self.settings = self.load_settings()
+
+    def load_settings(self):
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_settings(self, settings):
+        self.settings.update(settings)
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+
+    def clear(self):
+        """完全清除配置和头像文件"""
+        self.settings = {}
+        if self.config_file.exists():
+            self.config_file.unlink()
+        if self.avatar_file.exists():
+            self.avatar_file.unlink()
+
+    def get(self, key, default=None):
+        return self.settings.get(key, default)
+
+
+class SilentWebEnginePage(QWebEnginePage):
+    """自定义页面类，静默 JS 控制台输出"""
+    def javaScriptConsoleMessage(self, level, message, lineID, sourceID):
+        # 忽略所有来自网页控制台的消息
+        pass
+
+
+class LoginDialog(QDialog):
+    """登录对话框"""
+    login_success = pyqtSignal(dict)  # 发送登录成功的用户信息和cookie
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("登录行者")
+        self.resize(1000, 700)
+        self.layout = QVBoxLayout(self)
+        
+        self.browser = QWebEngineView()
+        # 使用静默页面处理器
+        self.browser.setPage(SilentWebEnginePage(self.browser))
+        self.layout.addWidget(self.browser)
+        
+        # 获取 Cookie 存储
+        self.profile = QWebEngineProfile.defaultProfile()
+        self.cookie_store = self.profile.cookieStore()
+        self.cookie_store.cookieAdded.connect(self.on_cookie_added)
+        
+        self.cookies_dict = {}
+        self.is_logging_in = False
+        
+        # 加载登录页面
+        self.browser.load(QUrl("https://www.imxingzhe.com/login"))
+
+    def on_cookie_added(self, cookie):
+        name = cookie.name().data().decode()
+        value = cookie.value().data().decode()
+        self.cookies_dict[name] = value
+        
+        # 如果检测到 sessionid，尝试获取用户信息
+        if "sessionid" in self.cookies_dict and not self.is_logging_in:
+            self.check_login_status()
+
+    def check_login_status(self):
+        self.is_logging_in = True
+        # 组装 Cookie 字符串
+        cookie_str = "; ".join([f"{k}={v}" for k, v in self.cookies_dict.items()])
+        
+        # 使用多线程或异步方式检查，这里简单处理
+        threading.Thread(target=self._verify_cookie, args=(cookie_str,), daemon=True).start()
+
+    def _verify_cookie(self, cookie_str):
+        url = "https://www.imxingzhe.com/api/v1/user/user_info/"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+            "Cookie": cookie_str,
+            "Referer": "https://www.imxingzhe.com/"
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == 0:
+                    user_data = data.get("data", {})
+                    result = {
+                        "cookies": cookie_str,
+                        "username": user_data.get("username"),
+                        "user_id": user_data.get("id"),
+                        "avatar_url": user_data.get("avatar")
+                    }
+                    self.login_success.emit(result)
+                    QTimer.singleShot(0, self.accept)
+                    return
+        except Exception as e:
+            print(f"验证登录失败: {e}")
+        
+        self.is_logging_in = False
 
 
 class ExportThread(QThread):
@@ -43,7 +174,7 @@ class ExportThread(QThread):
     progress_bar_update = pyqtSignal(int, int, str)  # current, total, filename
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, cookies, output_dir, limit, sport, year, month):
+    def __init__(self, cookies, output_dir, limit, sport, year, month, file_format):
         super().__init__()
         self.cookies = cookies
         self.output_dir = output_dir
@@ -51,6 +182,7 @@ class ExportThread(QThread):
         self.sport = sport
         self.year = year
         self.month = month
+        self.file_format = file_format
         self.is_running = True
     
     def run(self):
@@ -61,10 +193,6 @@ class ExportThread(QThread):
             
             # 创建导出实例
             xe = XossExport(self.cookies, self.output_dir)
-            
-            # 重写进度显示方法
-            original_print_status = xe._print_status
-            original_print_final_stats = xe._print_final_stats
             
             def gui_print_status(message, status="INFO"):
                 """重写状态打印方法"""
@@ -92,22 +220,20 @@ class ExportThread(QThread):
             xe._print_final_stats = gui_print_final_stats
             
             # 重写下载方法以支持进度条
-            original_download_gpx = xe.download_gpx
-            
-            def gui_download_gpx(title, sport_id):
+            def gui_download_workout(title, sport_id, file_format=None):
                 """重写下载方法"""
-                url = f"https://www.imxingzhe.com/api/v1/pgworkout/{sport_id}/gpx/"
+                fmt = file_format or self.file_format
+                self.progress_update.emit(f"正在下载: {title}...")
+                url = f"https://www.imxingzhe.com/api/v1/workout/{sport_id}/{fmt}/"
                 
-                # 使用 pathlib 构建文件路径
                 import os
                 safe_title = title.replace(" ", "_").replace("/", "_").replace("\\", "_")
-                filename = xe.export_path / f"{safe_title}_{sport_id}.gpx"
+                filename = xe.export_path / f"{safe_title}_{sport_id}.{fmt}"
 
                 try:
                     response = xe.session.get(url, headers=xe.headers)
                     response.raise_for_status()
 
-                    # 使用 pathlib 写入文件
                     with open(filename, "wb") as file:
                         file.write(response.content)
 
@@ -116,10 +242,10 @@ class ExportThread(QThread):
                     
                 except Exception as e:
                     xe.total_failed += 1
-                    self.progress_update.emit(f"下载失败: {title} (ID: {sport_id}) - {str(e)}")
+                    self.progress_update.emit(f"下载失败: {title} (ID: {sport_id}, 格式: {fmt}) - {str(e)}")
                     return False
             
-            xe.download_gpx = gui_download_gpx
+            xe.download_workout_file = gui_download_workout
             
             # 手动执行导出逻辑以支持进度条
             xe.start_time = time.time()
@@ -140,7 +266,6 @@ class ExportThread(QThread):
             processed_items = 0
             
             while True:
-                # 获取数据
                 data = xe.get_pgworkout(offset, self.limit, self.sport, self.year, self.month)
                 if not data:
                     break
@@ -172,9 +297,7 @@ class ExportThread(QThread):
                     # 更新进度条
                     self.progress_bar_update.emit(i + 1, len(sport_list), title)
                     
-                    success = xe.download_gpx(title, sport_id)
-                    if not success:
-                        self.progress_update.emit(f"下载失败: {title}")
+                    xe.download_workout_file(title, sport_id, self.file_format)
                     
                     time.sleep(1)  # 避免请求过于频繁
                 
@@ -188,7 +311,6 @@ class ExportThread(QThread):
             
             # 显示最终统计
             gui_print_final_stats()
-            
             self.finished.emit(True, "导出完成")
             
         except Exception as e:
@@ -202,17 +324,57 @@ class ExportThread(QThread):
 
 class XossExportGUI(QMainWindow):
     """主窗口类"""
+    avatar_ready = pyqtSignal(bytes)  # 新增信号：用于传递下载好的图片数据
     
     def __init__(self):
         super().__init__()
+        self.settings_manager = SettingsManager()
         self.export_thread = None
+        self._avatar_loading = False  # 下载锁
+        
+        # 连接信号
+        self.avatar_ready.connect(self._on_avatar_ready)
+        
+        # 获取默认桌面路径
+        desktop_path = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        
+        self.user_info = {
+            "cookies": self.settings_manager.get("cookies", ""),
+            "username": self.settings_manager.get("username", "未登录"),
+            "avatar_url": self.settings_manager.get("avatar_url", ""),
+            "user_id": self.settings_manager.get("user_id", ""),
+            "output_dir": self.settings_manager.get("output_dir", desktop_path)
+        }
         self.init_ui()
         self.setup_styles()
+        self.update_user_ui()  # 确保初始状态正确
+        
+        # 初始加载时尝试刷新用户信息
+        if self.user_info["cookies"]:
+            QTimer.singleShot(500, self.refresh_user_info)
     
+    def get_resource_path(self, relative_path):
+        """获取资源文件的绝对路径 (支持 PyInstaller 打包)"""
+        try:
+            # PyInstaller 创建临时文件夹并把路径存储在 _MEIPASS 中
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+        return os.path.join(base_path, relative_path)
+
     def init_ui(self):
         """初始化用户界面"""
         self.setWindowTitle("🚴 行者数据导出工具 - GUI版本")
         self.setGeometry(100, 100, 800, 600)
+        
+        # 设置窗口图标
+        icon_jpg = self.get_resource_path("icon.jpg")
+        icon_ico = self.get_resource_path("icon.ico")
+        
+        if os.path.exists(icon_jpg):
+            self.setWindowIcon(QIcon(icon_jpg))
+        elif os.path.exists(icon_ico):
+            self.setWindowIcon(QIcon(icon_ico))
         
         # 创建中央部件
         central_widget = QWidget()
@@ -239,6 +401,134 @@ class XossExportGUI(QMainWindow):
         # 底部状态栏
         self.create_status_bar()
     
+    def refresh_user_info(self):
+        """刷新用户信息"""
+        if not self.user_info["cookies"]:
+            self.update_user_ui()
+            return
+            
+        def _fetch():
+            url = "https://www.imxingzhe.com/api/v1/user/user_info/"
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "Cookie": self.user_info["cookies"],
+                "Referer": "https://www.imxingzhe.com/"
+            }
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("code") == 0:
+                        user_data = data.get("data", {})
+                        self.user_info.update({
+                            "username": user_data.get("username"),
+                            "user_id": user_data.get("id"),
+                            "avatar_url": user_data.get("avatar")
+                        })
+            except Exception as e:
+                print(f"刷新用户信息失败: {e}")
+            
+            QTimer.singleShot(0, self.update_user_ui)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def update_user_ui(self):
+        """更新用户界面显示"""
+        self.username_label.setText(self.user_info["username"])
+        self.user_id_label.setText(f"ID: {self.user_info['user_id']}" if self.user_info["user_id"] else "未登录")
+        
+        # 切换按钮显示
+        is_logged_in = bool(self.user_info["cookies"])
+        self.login_button.setVisible(not is_logged_in)
+        self.logout_button.setVisible(is_logged_in)
+        
+        # 处理头像显示
+        if is_logged_in:
+            avatar_path = self.settings_manager.avatar_file
+            if avatar_path.exists():
+                pixmap = QPixmap(str(avatar_path))
+                if not pixmap.isNull():
+                    self.avatar_label.setPixmap(pixmap)
+                    return
+            
+            # 如果本地没有或加载失败，且有 URL，则下载
+            if self.user_info["avatar_url"] and not self._avatar_loading:
+                self._avatar_loading = True
+                threading.Thread(target=self._load_avatar, args=(self.user_info["avatar_url"],), daemon=True).start()
+        else:
+            self.avatar_label.clear()
+
+    def logout(self):
+        """退出登录"""
+        reply = QMessageBox.question(self, "确认退出", "确定要退出登录并清除保存的信息吗？",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        # 清除内存数据
+        self.user_info = {
+            "cookies": "",
+            "username": "未登录",
+            "avatar_url": "",
+            "user_id": ""
+        }
+        # 清除持久化文件 (config.json 和 avatar.jpg)
+        self.settings_manager.clear()
+        
+        # 彻底清除浏览器数据
+        profile = QWebEngineProfile.defaultProfile()
+        profile.cookieStore().deleteAllCookies()
+        profile.clearHttpCache()
+        profile.clearAllVisitedLinks()
+        profile.cookieStore().loadAllCookies()
+        
+        # 更新界面
+        self.update_user_ui()
+        QMessageBox.information(self, "已退出", "已退出登录。下次登录时将需要重新输入账号或扫码。")
+
+    def _load_avatar(self, url):
+        """后台线程下载头像"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                # 保存到本地文件
+                with open(self.settings_manager.avatar_file, "wb") as f:
+                    f.write(response.content)
+                # 发送信号回主线程更新 UI
+                self.avatar_ready.emit(response.content)
+            else:
+                self._avatar_loading = False
+        except Exception as e:
+            print(f"加载头像出错: {e}")
+            self._avatar_loading = False
+
+    def _on_avatar_ready(self, data):
+        """主线程接收到图片数据后的处理"""
+        pixmap = QPixmap()
+        if pixmap.loadFromData(data):
+            self.avatar_label.setPixmap(pixmap)
+            self.avatar_label.repaint()  # 强制立即重绘
+        self._avatar_loading = False
+
+    def open_login_dialog(self):
+        """打开登录对话框"""
+        dialog = LoginDialog(self)
+        dialog.login_success.connect(self.on_login_success)
+        dialog.exec_()
+
+    def on_login_success(self, data):
+        """登录成功回调"""
+        self.user_info.update(data)
+        # 保存到配置
+        self.settings_manager.save_settings(self.user_info)
+        # 更新界面
+        self.update_user_ui()
+        QMessageBox.information(self, "登录成功", f"欢迎回来，{data['username']}！")
+
     def create_control_panel(self):
         """创建控制面板"""
         panel = QFrame()
@@ -251,19 +541,43 @@ class XossExportGUI(QMainWindow):
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
         
-        # Cookie 输入组
-        cookie_group = QGroupBox("认证信息")
-        cookie_layout = QVBoxLayout(cookie_group)
+        # 用户信息组 (替代原 Cookie 输入组)
+        user_group = QGroupBox("用户信息")
+        user_layout = QHBoxLayout(user_group)
         
-        cookie_label = QLabel("Cookie:")
-        cookie_layout.addWidget(cookie_label)
+        # 头像
+        self.avatar_label = QLabel()
+        self.avatar_label.setFixedSize(60, 60)
+        self.avatar_label.setStyleSheet("border-radius: 30px; border: 1px solid #ddd;")
+        self.avatar_label.setScaledContents(True)
+        user_layout.addWidget(self.avatar_label)
         
-        self.cookie_input = QTextEdit()
-        self.cookie_input.setMaximumHeight(100)
-        self.cookie_input.setPlaceholderText("请粘贴从浏览器复制的完整Cookie字符串...")
-        cookie_layout.addWidget(self.cookie_input)
+        # 用户名和 ID
+        user_info_layout = QVBoxLayout()
+        self.username_label = QLabel(self.user_info["username"])
+        self.username_label.setFont(QFont("Arial", 12, QFont.Bold))
+        user_info_layout.addWidget(self.username_label)
         
-        layout.addWidget(cookie_group)
+        self.user_id_label = QLabel(f"ID: {self.user_info['user_id']}" if self.user_info["user_id"] else "未登录")
+        user_info_layout.addWidget(self.user_id_label)
+        user_layout.addLayout(user_info_layout)
+        
+        user_layout.addStretch()
+        
+        # 登录/退出按钮
+        button_container = QVBoxLayout()
+        self.login_button = QPushButton("登录账号")
+        self.login_button.clicked.connect(self.open_login_dialog)
+        button_container.addWidget(self.login_button)
+        
+        self.logout_button = QPushButton("退出登录")
+        self.logout_button.clicked.connect(self.logout)
+        self.logout_button.setStyleSheet("color: #f44336;")
+        button_container.addWidget(self.logout_button)
+        
+        user_layout.addLayout(button_container)
+        
+        layout.addWidget(user_group)
         
         # 导出设置组
         settings_group = QGroupBox("导出设置")
@@ -271,25 +585,35 @@ class XossExportGUI(QMainWindow):
         
         # 输出目录
         settings_layout.addWidget(QLabel("输出目录:"), 0, 0)
-        self.output_dir_input = QLineEdit("export_file")
+        self.output_dir_input = QLineEdit(self.user_info["output_dir"])
         settings_layout.addWidget(self.output_dir_input, 0, 1)
         
         self.browse_button = QPushButton("浏览...")
         self.browse_button.clicked.connect(self.browse_output_dir)
         settings_layout.addWidget(self.browse_button, 0, 2)
         
-        # 每次请求数量
-        settings_layout.addWidget(QLabel("每次请求数量:"), 1, 0)
-        self.limit_combo = QComboBox()
-        self.limit_combo.addItems(["10", "20", "50", "100"])
-        self.limit_combo.setCurrentText("10")
-        settings_layout.addWidget(self.limit_combo, 1, 1)
+        # 导出文件格式
+        settings_layout.addWidget(QLabel("导出格式:"), 1, 0)
+        format_layout = QHBoxLayout()
+        self.gpx_radio = QRadioButton("GPX")
+        self.fit_radio = QRadioButton("FIT")
+        self.gpx_radio.setChecked(True)
+        
+        self.format_group = QButtonGroup(self)
+        self.format_group.addButton(self.gpx_radio)
+        self.format_group.addButton(self.fit_radio)
+        
+        format_layout.addWidget(self.gpx_radio)
+        format_layout.addWidget(self.fit_radio)
+        format_layout.addStretch()
+        settings_layout.addLayout(format_layout, 1, 1)
         
         layout.addWidget(settings_group)
         
-        # 筛选条件组
+        # 筛选条件组 (设为扩展以填充空间)
         filter_group = QGroupBox("筛选条件")
         filter_layout = QGridLayout(filter_group)
+        filter_layout.setSpacing(15)  # 增加控件间距
         
         # 运动类型
         filter_layout.addWidget(QLabel("运动类型:"), 0, 0)
@@ -313,20 +637,20 @@ class XossExportGUI(QMainWindow):
         filter_layout.addWidget(self.month_combo, 2, 1)
         
         layout.addWidget(filter_group)
+        layout.setStretchFactor(filter_group, 1)  # 让筛选组占用更多剩余空间
         
-        # 控制按钮
+        # 按钮组
         button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 10, 0, 0)
         
         self.start_button = QPushButton("🚀 开始导出")
-        self.start_button.clicked.connect(self.start_export)
+        self.start_button.setFont(QFont("Arial", 12, QFont.Bold))
+        self.start_button.setFixedHeight(60)  # 稍微加高一点按钮
         self.start_button.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
                 color: white;
                 border: none;
-                padding: 10px;
-                font-size: 14px;
-                font-weight: bold;
                 border-radius: 5px;
             }
             QPushButton:hover {
@@ -336,19 +660,18 @@ class XossExportGUI(QMainWindow):
                 background-color: #cccccc;
             }
         """)
+        self.start_button.clicked.connect(self.start_export)
         button_layout.addWidget(self.start_button)
         
-        self.stop_button = QPushButton("⏹️ 停止导出")
-        self.stop_button.clicked.connect(self.stop_export)
+        self.stop_button = QPushButton("🛑 停止导出")
+        self.stop_button.setFont(QFont("Arial", 12, QFont.Bold))
+        self.stop_button.setFixedHeight(60)  # 稍微加高一点按钮
         self.stop_button.setEnabled(False)
         self.stop_button.setStyleSheet("""
             QPushButton {
                 background-color: #f44336;
                 color: white;
                 border: none;
-                padding: 10px;
-                font-size: 14px;
-                font-weight: bold;
                 border-radius: 5px;
             }
             QPushButton:hover {
@@ -358,16 +681,13 @@ class XossExportGUI(QMainWindow):
                 background-color: #cccccc;
             }
         """)
+        self.stop_button.clicked.connect(self.stop_export)
         button_layout.addWidget(self.stop_button)
         
         layout.addLayout(button_layout)
         
-        
-        # 添加弹性空间
-        layout.addStretch()
-        
         return panel
-    
+
     def create_log_panel(self):
         """创建日志面板"""
         panel = QFrame()
@@ -382,8 +702,9 @@ class XossExportGUI(QMainWindow):
         # 日志文本框
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setFont(QFont("Courier New", 9))
         layout.addWidget(self.log_text)
+        layout.setStretchFactor(self.log_text, 1)  # 让日志框填充整个面板空间
         
         # 进度条
         self.progress_bar = QProgressBar()
@@ -438,49 +759,43 @@ class XossExportGUI(QMainWindow):
         )
         if directory:
             self.output_dir_input.setText(directory)
+            # 记住修改后的路径
+            self.user_info["output_dir"] = directory
+            self.settings_manager.save_settings({"output_dir": directory})
     
     def validate_inputs(self):
         """验证输入"""
-        # 获取Cookie并自动去除换行符和多余空格
-        cookies = self.cookie_input.toPlainText().strip()
-        # 去除所有换行符和多余空格，保持Cookie格式
-        cookies = " ".join(cookies.split())
-        
-        if not cookies:
-            QMessageBox.warning(self, "输入错误", "请输入Cookie")
+        if not self.user_info["cookies"] or "sessionid=" not in self.user_info["cookies"]:
+            QMessageBox.warning(self, "认证错误", "请先点击[登录账号]进行登录")
             return False
-        
-        if "sessionid=" not in cookies:
-            QMessageBox.warning(
-                self, "Cookie错误", 
-                "Cookie中必须包含sessionid字段\n请确保从浏览器复制的Cookie是完整的"
-            )
-            return False
-        
         return True
-    
+
     def start_export(self):
         """开始导出"""
         if not self.validate_inputs():
             return
-        
+
         # 获取参数
-        cookies = self.cookie_input.toPlainText().strip()
-        # 去除所有换行符和多余空格
-        cookies = " ".join(cookies.split())
-        output_dir = self.output_dir_input.text().strip()
-        limit = int(self.limit_combo.currentText())
+        cookies = self.user_info["cookies"]
+        base_dir = self.output_dir_input.text().strip()
+        # 记住手动修改后的基础路径
+        self.user_info["output_dir"] = base_dir
+        self.settings_manager.save_settings({"output_dir": base_dir})
         
-        sport = self.sport_combo.currentText()
-        if sport == "全部":
-            sport = ""
-        else:
-            sport = convert_sport_to_number(sport)
+        limit = 10  # 固定为 10
+        file_format = "gpx" if self.gpx_radio.isChecked() else "fit"
+        
+        # 自动创建带时间戳的子目录: 格式_月日时分秒
+        timestamp = time.strftime("%m%d%H%M%S")
+        sub_dir_name = f"{file_format}_{timestamp}"
+        final_output_dir = str(Path(base_dir) / sub_dir_name)
+        
+        sport_name = self.sport_combo.currentText()
+        sport_param = "" if sport_name == "全部" else convert_sport_to_number(sport_name)
         
         year = self.year_input.text().strip()
-        month = self.month_combo.currentText()
-        if month == "全部":
-            month = ""
+        month_name = self.month_combo.currentText()
+        month_param = "" if month_name == "全部" else month_name
         
         # 更新UI状态
         self.start_button.setEnabled(False)
@@ -492,19 +807,19 @@ class XossExportGUI(QMainWindow):
         # 清空日志
         self.log_text.clear()
         self.log_text.append("🚀 开始导出数据...")
-        self.log_text.append(f"📁 输出目录: {output_dir}")
-        self.log_text.append(f"📊 每次请求数量: {limit}")
-        if sport:
-            self.log_text.append(f"🏃 运动类型: {sport}")
+        self.log_text.append(f"📁 基础目录: {base_dir}")
+        self.log_text.append(f"📂 导出目录: {final_output_dir}")
+        if sport_name != "全部":
+            self.log_text.append(f"🏃 运动类型: {sport_name}")
         if year:
             self.log_text.append(f"📅 年份: {year}")
-        if month:
-            self.log_text.append(f"📅 月份: {month}")
+        if month_name != "全部":
+            self.log_text.append(f"📅 月份: {month_name}")
         self.log_text.append("-" * 50)
         
         # 创建并启动导出线程
         self.export_thread = ExportThread(
-            cookies, output_dir, limit, sport, year, month
+            cookies, final_output_dir, limit, sport_param, year, month_param, file_format
         )
         self.export_thread.progress_update.connect(self.update_log)
         self.export_thread.progress_bar_update.connect(self.update_progress_bar)
@@ -548,26 +863,29 @@ class XossExportGUI(QMainWindow):
             QMessageBox.information(self, "导出完成", message)
         else:
             self.status_bar.showMessage("导出失败")
-            self.log_text.append("❌ " + message)
-            QMessageBox.critical(self, "导出失败", message)
+            self.log_text.append("❌ 错误: " + message)
+            QMessageBox.critical(self, "导出错误", message)
     
     def clear_log(self):
         """清空日志"""
         self.log_text.clear()
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("日志已清空")
 
 
 def main():
-    """主函数"""
+    """启动应用程序"""
     app = QApplication(sys.argv)
+    
+    # 设置应用样式
+    app.setStyle("Fusion")
+    
+    # 设置应用信息
     app.setApplicationName("行者数据导出工具")
-    app.setApplicationVersion("1.2.0")
+    app.setApplicationVersion("3.0.0")
     
-    # 设置应用图标（如果有的话）
-    # app.setWindowIcon(QIcon("icon.png"))
-    
-    window = XossExportGUI()
-    window.show()
-    
+    gui = XossExportGUI()
+    gui.show()
     sys.exit(app.exec_())
 
 

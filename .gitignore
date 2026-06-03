@@ -117,5 +117,9 @@ Thumbs.db
 
 # Project specific
 export_file/
+export_file_*/
 *.gpx
+*.fit
+*.zip
+config.json
 cookies.txt

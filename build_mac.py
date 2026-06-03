@@ -82,14 +82,23 @@ class MacAppBuilder:
         """创建应用图标"""
         print("🎨 创建应用图标...")
         
-        # 创建一个简单的图标文件（如果不存在）
-        icon_path = "app_icon.icns"
-        if not os.path.exists(icon_path):
-            print("  ⚠️ 未找到 app_icon.icns，将使用默认图标")
-            return None
-        else:
-            print(f"  ✅ 使用图标文件: {icon_path}")
-            return icon_path
+        # 优先使用 icon.icns (macOS 标准)
+        if os.path.exists("icon.icns"):
+            print("  ✅ 使用 icon.icns")
+            return "icon.icns"
+            
+        # 尝试使用 icon.ico
+        if os.path.exists("icon.ico"):
+            print("  ✅ 使用 icon.ico")
+            return "icon.ico"
+            
+        # 尝试使用 app_icon.icns (旧逻辑)
+        if os.path.exists("app_icon.icns"):
+            print("  ✅ 使用 app_icon.icns")
+            return "app_icon.icns"
+            
+        print("  ⚠️ 未找到图标文件，将使用默认图标")
+        return None
     
     def build_app(self):
         """构建 .app 应用程序"""
@@ -107,6 +116,7 @@ class MacAppBuilder:
             "--hidden-import", "PyQt5.QtCore",
             "--hidden-import", "PyQt5.QtGui",
             "--hidden-import", "PyQt5.QtWidgets",
+            "--hidden-import", "PyQt5.QtWebEngineWidgets",
             "--hidden-import", "requests",
             "--hidden-import", "tqdm",
             "--hidden-import", "xoss_export",

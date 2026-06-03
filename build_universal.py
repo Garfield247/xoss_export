@@ -91,15 +91,23 @@ class UniversalBuilder:
         """构建 Windows 版本"""
         print("🔨 构建 Windows 版本...")
         
+        icon_arg = []
+        if os.path.exists("icon.ico"):
+            icon_arg = ["--icon", "icon.ico"]
+            
         cmd = [
             sys.executable, "-m", "PyInstaller",
             "--onefile",
             "--windowed",
             "--name", self.project_name,
             "--add-data", "README.md;.",
+            "--add-data", "icon.jpg;.",
+            "--add-data", "icon.ico;.",
+        ] + icon_arg + [
             "--hidden-import", "PyQt5.QtCore",
             "--hidden-import", "PyQt5.QtGui",
             "--hidden-import", "PyQt5.QtWidgets",
+            "--hidden-import", "PyQt5.QtWebEngineWidgets",
             "--hidden-import", "requests",
             "--hidden-import", "tqdm",
             "--hidden-import", "xoss_export",
@@ -120,15 +128,27 @@ class UniversalBuilder:
         """构建 macOS 版本"""
         print("🔨 构建 macOS 版本...")
         
+        icon_arg = []
+        # macOS 理想情况下需要 .icns，但有时 pyinstaller 能处理 .ico 
+        # 如果没有 .icns 且有 .ico，尝试使用
+        if os.path.exists("icon.icns"):
+            icon_arg = ["--icon", "icon.icns"]
+        elif os.path.exists("icon.ico"):
+            icon_arg = ["--icon", "icon.ico"]
+            
         cmd = [
             sys.executable, "-m", "PyInstaller",
             "--onedir",
             "--windowed",
             "--name", "XossExport",
             "--add-data", "README.md:.",
+            "--add-data", "icon.jpg:.",
+            "--add-data", "icon.ico:.",
+        ] + icon_arg + [
             "--hidden-import", "PyQt5.QtCore",
             "--hidden-import", "PyQt5.QtGui",
             "--hidden-import", "PyQt5.QtWidgets",
+            "--hidden-import", "PyQt5.QtWebEngineWidgets",
             "--hidden-import", "requests",
             "--hidden-import", "tqdm",
             "--hidden-import", "xoss_export",
@@ -149,15 +169,22 @@ class UniversalBuilder:
         """构建 Linux 版本"""
         print("🔨 构建 Linux 版本...")
         
+        icon_arg = []
+        if os.path.exists("icon.ico"):
+            icon_arg = ["--icon", "icon.ico"]
+            
         cmd = [
             sys.executable, "-m", "PyInstaller",
             "--onefile",
             "--windowed",
             "--name", "xoss-export",
             "--add-data", "README.md:.",
-            "--hidden-import", "PyQt5.QtCore",
+            "--add-data", "icon.jpg:.",
+            "--add-data", "icon.ico:.",
+        ] + icon_arg + [
             "--hidden-import", "PyQt5.QtGui",
             "--hidden-import", "PyQt5.QtWidgets",
+            "--hidden-import", "PyQt5.QtWebEngineWidgets",
             "--hidden-import", "requests",
             "--hidden-import", "tqdm",
             "--hidden-import", "xoss_export",

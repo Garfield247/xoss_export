@@ -1,9 +1,10 @@
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Dict
-import os
+
 from requests import Session
 from tqdm import tqdm
 
@@ -78,7 +79,7 @@ class XossExport:
     def get_pgworkout(self, offset=0, limit=10, sport="", year="", month="") -> Dict:
         url = f"https://www.imxingzhe.com/api/v1/pgworkout/?offset={offset}&limit={limit}&sport={sport}&year={year}&month={month}"
 
-        self._print_status(f"正在获取数据 (偏移: {offset}, 限制: {limit})", "INFO")
+        self._print_status(f"正在获取数据 (偏移: {offset}, 长度: {limit})", "INFO")
 
         payload = {}
         response = self.session.request("GET", url, headers=self.headers, data=payload)
@@ -92,12 +93,15 @@ class XossExport:
             self._print_status(f"请求失败，状态码: {response.status_code}", "ERROR")
             return None
 
-    def download_gpx(self, title: str, sport_id: int):
-        url = f"https://www.imxingzhe.com/api/v1/pgworkout/{sport_id}/gpx/"
+    def download_workout_file(
+        self, title: str, sport_id: int, file_format: str = "gpx"
+    ):
+        """下载运动文件 (gpx 或 fit)"""
+        url = f"https://www.imxingzhe.com/api/v1/workout/{sport_id}/{file_format}/"
 
         # 使用 pathlib 构建文件路径
         safe_title = title.replace(" ", "_").replace("/", "_").replace("\\", "_")
-        filename = self.export_path / f"{safe_title}_{sport_id}.gpx"
+        filename = self.export_path / f"{safe_title}_{sport_id}.{file_format}"
 
         try:
             response = self.session.get(url, headers=self.headers)
@@ -108,19 +112,19 @@ class XossExport:
                 file.write(response.content)
 
             self.total_downloaded += 1
-            # 下载成功，进度条已经显示了文件名，这里不需要额外输出
             return True
 
         except Exception as e:
             self.total_failed += 1
             self._print_status(
-                f"下载失败: {title} (ID: {sport_id}) - {str(e)}", "ERROR"
+                f"下载失败: {title} (ID: {sport_id}, 格式: {file_format}) - {str(e)}",
+                "ERROR",
             )
             return False
 
-    def run(self, limit=100, sport="", year="", month=""):
+    def run(self, limit=100, sport="", year="", month="", file_format="gpx"):
         self.start_time = time.time()
-        self._print_status("开始导出行者数据...", "INFO")
+        self._print_status(f"开始导出行者数据 ({file_format})...", "INFO")
         self._print_status(f"导出目录: {self.export_path.absolute()}", "INFO")
 
         # 显示筛选条件
@@ -178,7 +182,7 @@ class XossExport:
                     # 更新进度条描述
                     pbar.set_postfix_str(f"正在下载: {title[:20]}...")
 
-                    success = self.download_gpx(title, sport_id)
+                    success = self.download_workout_file(title, sport_id, file_format)
                     if not success:
                         self._print_status(f"下载失败: {title}", "WARNING")
 
@@ -280,6 +284,14 @@ def main():
 
     parser.add_argument("--month", "-m", default="", help="月份筛选（默认: 全部）")
 
+    parser.add_argument(
+        "--format",
+        "-f",
+        choices=["gpx", "fit"],
+        default="gpx",
+        help="导出文件格式 (默认: gpx)",
+    )
+
     args = parser.parse_args()
 
     # 验证参数
@@ -315,7 +327,13 @@ def main():
 
     try:
         xe = XossExport(args.cookies, args.output_dir)
-        xe.run(limit=args.limit, sport=sport_param, year=args.year, month=args.month)
+        xe.run(
+            limit=args.limit,
+            sport=sport_param,
+            year=args.year,
+            month=args.month,
+            file_format=args.format,
+        )
     except KeyboardInterrupt:
         print("\n\033[93m[⚠] 用户中断了程序\033[0m")
         sys.exit(1)
@@ -324,11 +342,21 @@ def main():
         sys.exit(1)
 
 
-def run_export(cookies, output_dir="export_file", limit=10, sport="", year="", month=""):
+def run_export(
+    cookies,
+    output_dir="export_file",
+    limit=10,
+    sport="",
+    year="",
+    month="",
+    file_format="gpx",
+):
     """导出函数，供GUI调用"""
     try:
         xe = XossExport(cookies, output_dir)
-        xe.run(limit=limit, sport=sport, year=year, month=month)
+        xe.run(
+            limit=limit, sport=sport, year=year, month=month, file_format=file_format
+        )
         return True, "导出完成"
     except Exception as e:
         return False, str(e)
